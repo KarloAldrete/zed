@@ -139,13 +139,46 @@ impl PlatformAtlas for WgpuAtlas {
         if bytes_per_row < row || bytes.len() < (h as usize - 1) * bytes_per_row + row {
             return false;
         }
-        // Queued like an insert, so it lands after any upload still pending for this tile.
+        let origin = tile.bounds.origin + region.origin;
+        let swizzles = texture.format == wgpu::TextureFormat::Rgba8Unorm;
+        let queued = lock.backend.pending_uploads.iter().any(|u| u.id == tile.texture_id);
+        if !swizzles && !queued {
+            // Straight from the caller's rows: write_texture copies them into its staging
+            // buffer now, so a frame-sized update costs one copy instead of three.
+            let texture = &lock.backend.storage[tile.texture_id].texture;
+            lock.backend.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: origin.x.0 as u32,
+                        y: origin.y.0 as u32,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &bytes[..(h as usize - 1) * bytes_per_row + row],
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row as u32),
+                    rows_per_image: None,
+                },
+                wgpu::Extent3d {
+                    width: w as u32,
+                    height: h as u32,
+                    depth_or_array_layers: 1,
+                },
+            );
+            return true;
+        }
+        // Queued behind an insert or update still pending for this texture, so it lands
+        // after it.
         let mut packed = Vec::with_capacity(row * h as usize);
         for r in 0..h as usize {
             packed.extend_from_slice(&bytes[r * bytes_per_row..r * bytes_per_row + row]);
         }
         let bounds = Bounds {
-            origin: tile.bounds.origin + region.origin,
+            origin,
             size: region.size,
         };
         lock.backend.upload_texture(tile.texture_id, bounds, &packed);
@@ -493,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn update_tile_queues_only_the_region() -> anyhow::Result<()> {
+    fn update_tile_writes_only_the_region() -> anyhow::Result<()> {
         let (device, queue) = test_device_and_queue()?;
         let atlas = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
         let key = AtlasKey::Image(RenderImageParams {
@@ -515,19 +548,25 @@ mod tests {
         let tile = atlas
             .get_or_insert_with(key.clone(), &mut || Ok(Some((size, Cow::Owned(vec![0; 64])))))?
             .expect("tile should be created");
-        atlas.before_frame();
 
-        // rows 1-2, columns 1-2, read from the frame at its own row pitch
+        // behind the insert still pending: rows 1-2, columns 1-2, packed and queued after it
         assert!(atlas.update_tile(&key, region(1, 1, 2, 2), &frame[16 + 4..], 16));
         {
             let lock = atlas.0.lock();
             let upload = lock.backend.pending_uploads.last().expect("an upload");
+            assert_eq!(lock.backend.pending_uploads.len(), 2);
             assert_eq!(upload.bounds, Bounds {
                 origin: tile.bounds.origin + Point::new(DevicePixels(1), DevicePixels(1)),
                 size: Size::new(DevicePixels(2), DevicePixels(2)),
             });
             assert_eq!(upload.data, [20, 21, 22, 23, 24, 25, 26, 27, 36, 37, 38, 39, 40, 41, 42, 43]);
         }
+        atlas.before_frame();
+
+        // nothing pending: written to the texture straight away, nothing queued
+        assert!(atlas.update_tile(&key, region(1, 1, 2, 2), &frame[16 + 4..], 16));
+        assert!(atlas.0.lock().backend.pending_uploads.is_empty());
+
         // past the tile, or too few bytes for the rows asked
         assert!(!atlas.update_tile(&key, region(3, 3, 2, 2), &frame, 16));
         assert!(!atlas.update_tile(&key, region(0, 0, 4, 4), &frame[..40], 16));
