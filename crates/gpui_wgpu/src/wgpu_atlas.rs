@@ -113,6 +113,65 @@ impl PlatformAtlas for WgpuAtlas {
     fn remove(&self, key: &AtlasKey) {
         self.0.lock().remove(key);
     }
+
+    fn update_tile(
+        &self,
+        key: &AtlasKey,
+        region: Bounds<DevicePixels>,
+        bytes: &[u8],
+        bytes_per_row: usize,
+    ) -> bool {
+        let mut lock = self.0.lock();
+        let Some(tile) = lock.tile(key) else {
+            return false;
+        };
+        let size = tile.bounds.size;
+        let (x, y) = (region.origin.x.0, region.origin.y.0);
+        let (w, h) = (region.size.width.0, region.size.height.0);
+        if x < 0 || y < 0 || w <= 0 || h <= 0 || x + w > size.width.0 || y + h > size.height.0 {
+            return false;
+        }
+        let Some(texture) = lock.backend.storage.get(tile.texture_id) else {
+            return false;
+        };
+        let bpp = texture.bytes_per_pixel() as usize;
+        let row = w as usize * bpp;
+        if bytes_per_row < row || bytes.len() < (h as usize - 1) * bytes_per_row + row {
+            return false;
+        }
+        // Queued like an insert, so it lands after any upload still pending for this tile.
+        let mut packed = Vec::with_capacity(row * h as usize);
+        for r in 0..h as usize {
+            packed.extend_from_slice(&bytes[r * bytes_per_row..r * bytes_per_row + row]);
+        }
+        let bounds = Bounds {
+            origin: tile.bounds.origin + region.origin,
+            size: region.size,
+        };
+        lock.backend.upload_texture(tile.texture_id, bounds, &packed);
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    fn copy_dmabuf_into_tile(&self, key: &AtlasKey, frame: &gpui::DmaBufFrame) -> bool {
+        let mut lock = self.0.lock();
+        let Some(tile) = lock.tile(key) else {
+            return false;
+        };
+        let backend = &mut lock.backend;
+        // Whatever an earlier insert or update still has queued for this texture lands first.
+        backend.flush_uploads();
+        let Some(texture) = backend.storage.get(tile.texture_id) else {
+            return false;
+        };
+        match crate::dmabuf::copy_into(&backend.device, &backend.queue, frame, &texture.texture, tile.bounds) {
+            Ok(()) => true,
+            Err(error) => {
+                log::warn!("dmabuf import failed: {error:#}");
+                false
+            }
+        }
+    }
 }
 
 impl AtlasBackend for WgpuAtlasTextures {
@@ -431,6 +490,49 @@ mod tests {
                 .map_err(|error| anyhow::anyhow!("failed to request device: {error}"))?;
             Ok((Arc::new(device), Arc::new(queue)))
         })
+    }
+
+    #[test]
+    fn update_tile_queues_only_the_region() -> anyhow::Result<()> {
+        let (device, queue) = test_device_and_queue()?;
+        let atlas = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
+        let key = AtlasKey::Image(RenderImageParams {
+            image_id: ImageId(7),
+            frame_index: 0,
+        });
+        let size = Size {
+            width: DevicePixels(4),
+            height: DevicePixels(4),
+        };
+        let region = |x, y, w, h| Bounds {
+            origin: Point::new(DevicePixels(x), DevicePixels(y)),
+            size: Size::new(DevicePixels(w), DevicePixels(h)),
+        };
+        // a 4x4 frame whose bytes are their own index
+        let frame: Vec<u8> = (0..64).collect();
+        assert!(!atlas.update_tile(&key, region(0, 0, 1, 1), &frame, 16));
+
+        let tile = atlas
+            .get_or_insert_with(key.clone(), &mut || Ok(Some((size, Cow::Owned(vec![0; 64])))))?
+            .expect("tile should be created");
+        atlas.before_frame();
+
+        // rows 1-2, columns 1-2, read from the frame at its own row pitch
+        assert!(atlas.update_tile(&key, region(1, 1, 2, 2), &frame[16 + 4..], 16));
+        {
+            let lock = atlas.0.lock();
+            let upload = lock.backend.pending_uploads.last().expect("an upload");
+            assert_eq!(upload.bounds, Bounds {
+                origin: tile.bounds.origin + Point::new(DevicePixels(1), DevicePixels(1)),
+                size: Size::new(DevicePixels(2), DevicePixels(2)),
+            });
+            assert_eq!(upload.data, [20, 21, 22, 23, 24, 25, 26, 27, 36, 37, 38, 39, 40, 41, 42, 43]);
+        }
+        // past the tile, or too few bytes for the rows asked
+        assert!(!atlas.update_tile(&key, region(3, 3, 2, 2), &frame, 16));
+        assert!(!atlas.update_tile(&key, region(0, 0, 4, 4), &frame[..40], 16));
+        atlas.before_frame();
+        Ok(())
     }
 
     #[test]

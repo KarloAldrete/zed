@@ -4868,6 +4868,12 @@ impl Window {
         Ok(())
     }
 
+    /// The atlas this window's sprites live in, to update a cached image in place
+    /// ([`PlatformAtlas::update_tile`]) from outside a paint.
+    pub fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
+        self.sprite_atlas.clone()
+    }
+
     /// Paint an image into the scene for the next frame at the current z-index.
     /// This method will panic if the frame_index is not valid
     ///

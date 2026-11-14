@@ -1432,10 +1432,58 @@ pub trait PlatformAtlas {
     ) -> Result<Option<AtlasTile>>;
     fn remove(&self, key: &AtlasKey);
 
+    /// Overwrites `region` (in the tile's own pixel space) of the tile cached under `key`
+    /// with tightly packed rows read `bytes_per_row` apart, in the bytes the key was
+    /// inserted with (BGRA for images). For content that changes in place, such as an
+    /// embedded browser's frames, without a new tile per frame. Returns false when `key`
+    /// holds no tile or the backend cannot update one.
+    fn update_tile(
+        &self,
+        _key: &AtlasKey,
+        _region: Bounds<DevicePixels>,
+        _bytes: &[u8],
+        _bytes_per_row: usize,
+    ) -> bool {
+        false
+    }
+
+    /// Copies a frame the GPU already holds, shared as a Linux DMA-BUF, into the tile
+    /// cached under `key`, on the GPU. The copy has finished when this returns, so the
+    /// producer may reuse the buffer. Returns false when the backend cannot import it.
+    fn copy_dmabuf_into_tile(&self, _key: &AtlasKey, _frame: &DmaBufFrame) -> bool {
+        false
+    }
+
     #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
     fn contains(&self, _key: &AtlasKey) -> bool {
         false
     }
+}
+
+/// A frame shared by another process as a Linux DMA-BUF (one plane per entry).
+#[derive(Debug, Clone)]
+pub struct DmaBufFrame {
+    /// Width of the buffer in pixels (its coded size, which may pad past what is shown).
+    pub width: u32,
+    /// Height of the buffer in pixels.
+    pub height: u32,
+    /// DRM fourcc (`AR24`, `XR24`, `AB24`, `XB24`).
+    pub fourcc: u32,
+    /// DRM format modifier; `0` is linear.
+    pub modifier: u64,
+    /// The buffer's planes; RGBA formats have one.
+    pub planes: Vec<DmaBufPlane>,
+}
+
+/// One plane of a [`DmaBufFrame`]. The fd stays owned by the producer.
+#[derive(Debug, Clone, Copy)]
+pub struct DmaBufPlane {
+    /// The DMA-BUF file descriptor, borrowed for the call.
+    pub fd: i32,
+    /// Byte offset of the plane in the buffer.
+    pub offset: u64,
+    /// Bytes between the starts of two rows.
+    pub stride: u32,
 }
 
 #[doc(hidden)]
@@ -1466,6 +1514,10 @@ impl<Backend> AtlasState<Backend> {
 
     pub fn contains(&self, key: &AtlasKey) -> bool {
         self.tiles_by_key.contains_key(key)
+    }
+
+    pub fn tile(&self, key: &AtlasKey) -> Option<AtlasTile> {
+        self.tiles_by_key.get(key).copied()
     }
 
     pub fn clear(&mut self, reset_backend: impl FnOnce(&mut Backend)) {
